@@ -1,0 +1,266 @@
+#include "FolderPanel.h"
+#include "models/FolderModel.h"
+#include "services/SettingsManager.h"
+
+#include <QTreeView>
+#include <QToolBar>
+#include <QVBoxLayout>
+#include <QFileDialog>
+#include <QMenu>
+#include <QAction>
+#include <QAbstractItemModel>
+#include <QMessageBox>
+#include <QLabel>
+#include <QLineEdit>
+#include <QClipboard>
+#include <QDir>
+#include <QGuiApplication>
+
+FolderPanel::FolderPanel(SettingsManager *settingsManager, QWidget *parent)
+    : QWidget(parent)
+    , m_settingsManager(settingsManager)
+{
+    m_folderModel = new FolderModel(this);
+
+    setupUi();
+    setupConnections();
+    restoreFolderList();
+}
+
+FolderPanel::~FolderPanel() = default;
+
+void FolderPanel::setupUi()
+{
+    auto *layout = new QVBoxLayout(this);
+    layout->setContentsMargins(16, 16, 16, 12);
+    layout->setSpacing(10);
+
+    setObjectName(QStringLiteral("folderPanelRoot"));
+    setStyleSheet(
+        "QWidget#folderPanelRoot { background-color: #FFFFFF; border: 1px solid #E3E7EC; border-radius: 8px; }"
+        "QLabel#folderTitle { color: #111827; font-size: 15px; font-weight: 700; border: none; background: transparent; }"
+        "QLabel#folderSubtitle { color: #6B7280; font-size: 11px; border: none; background: transparent; }"
+        "QTreeView#folderTreeView { background-color: #FFFFFF; border: none; padding: 2px; outline: none; }"
+        "QTreeView#folderTreeView::item { padding: 3px 6px; border-radius: 5px; min-height: 24px; color: #243041; }"
+        "QTreeView#folderTreeView::item:hover { background-color: #F5F7FA; }"
+        "QTreeView#folderTreeView::item:selected { background-color: #E5F1FB; color: #111827; }"
+        "QLineEdit#folderPathInput { background-color: #F8FAFC; border: 1px solid #E5EAF1; border-radius: 6px; padding: 5px 8px; color: #374151; }"
+        "QLineEdit#folderPathInput:focus { background-color: #FFFFFF; border-color: #0078D4; }"
+        "QLabel#folderStatusLabel { color: #5E6A7A; font-size: 11px; border: none; background: transparent; }");
+
+    // ---- Toolbar retained for command actions, hidden visually in the new shell ----
+    m_toolBar = new QToolBar(this);
+    m_toolBar->setVisible(false);
+    m_toolBar->setIconSize(QSize(16, 16));
+    m_toolBar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    m_toolBar->setStyleSheet(
+        "QToolBar { background-color: #FAFAFA; border: none; "
+        "border-bottom: 1px solid #E0E0E0; padding: 4px 8px; spacing: 4px; }");
+
+    QAction *addAction = m_toolBar->addAction(tr("+ 添加"));
+    addAction->setToolTip(tr("Add a folder to the list"));
+
+    m_toolBar->addSeparator();
+
+    QAction *refreshAction = m_toolBar->addAction(tr("↻ 刷新"));
+    refreshAction->setToolTip(tr("Refresh all folders"));
+
+    QAction *clearAction = m_toolBar->addAction(tr("✕ 清空"));
+    clearAction->setToolTip(tr("Remove all folders"));
+
+    connect(addAction, &QAction::triggered, this, &FolderPanel::addFolderViaDialog);
+    connect(refreshAction, &QAction::triggered, this, &FolderPanel::refreshFolders);
+    connect(clearAction, &QAction::triggered, this, &FolderPanel::clearFolders);
+
+    // ---- Path Input ----
+    m_pathInput = new QLineEdit(this);
+    m_pathInput->setObjectName(QStringLiteral("folderPathInput"));
+    m_pathInput->setPlaceholderText(tr("输入文件夹路径后按 Enter"));
+    m_pathInput->setClearButtonEnabled(true);
+    m_pathInput->setFixedHeight(30);
+    layout->addWidget(m_pathInput);
+
+    // ---- Tree View ----
+    m_treeView = new QTreeView(this);
+    m_treeView->setObjectName(QStringLiteral("folderTreeView"));
+    m_treeView->setModel(m_folderModel);
+    m_treeView->setHeaderHidden(true);
+    m_treeView->setUniformRowHeights(true);
+    m_treeView->setContextMenuPolicy(Qt::CustomContextMenu);
+    m_treeView->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_treeView->setAnimated(true);
+    m_treeView->setExpandsOnDoubleClick(true);
+    m_treeView->setIndentation(20);
+    m_treeView->setRootIsDecorated(true);
+
+    layout->addWidget(m_treeView);
+
+    m_statusLabel = new QLabel(this);
+    m_statusLabel->setObjectName(QStringLiteral("folderStatusLabel"));
+    layout->addWidget(m_statusLabel);
+}
+
+void FolderPanel::setupConnections()
+{
+    connect(m_treeView, &QTreeView::customContextMenuRequested,
+            this, &FolderPanel::onContextMenu);
+
+    connect(m_folderModel, &FolderModel::addToCompareRequested,
+            this, &FolderPanel::addToCompareRequested);
+    connect(m_folderModel, &QAbstractItemModel::rowsInserted,
+            this, &FolderPanel::syncRootList);
+    connect(m_folderModel, &QAbstractItemModel::rowsRemoved,
+            this, &FolderPanel::syncRootList);
+    connect(m_folderModel, &QAbstractItemModel::modelReset,
+            this, &FolderPanel::syncRootList);
+
+    connect(m_pathInput, &QLineEdit::returnPressed,
+            this, &FolderPanel::onPathSubmitted);
+}
+
+void FolderPanel::addFolderViaDialog()
+{
+    QString dir = QFileDialog::getExistingDirectory(
+        this,
+        tr("选择文件夹"),
+        QString(),
+        QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks
+    );
+
+    if (dir.isEmpty()) {
+        return;
+    }
+
+    if (m_folderModel->addFolder(dir)) {
+        saveFolderList();
+        syncRootList();
+    }
+}
+
+void FolderPanel::refreshFolders()
+{
+    m_folderModel->refreshAll();
+}
+
+void FolderPanel::onPathSubmitted()
+{
+    if (!m_pathInput) {
+        return;
+    }
+
+    const QString inputPath = m_pathInput->text().trimmed();
+    if (inputPath.isEmpty()) {
+        return;
+    }
+
+    if (m_folderModel->addFolder(inputPath)) {
+        saveFolderList();
+        syncRootList();
+        m_pathInput->clear();
+    }
+}
+
+void FolderPanel::clearFolders()
+{
+    if (m_folderModel->rootFolderPaths().isEmpty()) {
+        return;
+    }
+
+    QMessageBox::StandardButton reply = QMessageBox::question(
+        this,
+        tr("Clear All Folders"),
+        tr("Are you sure you want to remove all folders?"),
+        QMessageBox::Yes | QMessageBox::No,
+        QMessageBox::No
+    );
+
+    if (reply == QMessageBox::Yes) {
+        m_folderModel->clearAll();
+        saveFolderList();
+        syncRootList();
+    }
+}
+
+void FolderPanel::onContextMenu(const QPoint &pos)
+{
+    QModelIndex index = m_treeView->indexAt(pos);
+    if (!index.isValid()) {
+        return;
+    }
+
+    QString path = m_folderModel->filePath(index);
+    bool isRoot = m_folderModel->isRootFolder(index);
+
+    QMenu contextMenu(this);
+
+    // "Add to Compare" — available for any folder
+    QAction *addToCompareAction = contextMenu.addAction(tr("Add to Compare"));
+    connect(addToCompareAction, &QAction::triggered, this, [this, path]() {
+        emit addToCompareRequested(path);
+    });
+
+    // "Export Categories" — available for any folder
+    QAction *exportAction = contextMenu.addAction(tr("导出分类…"));
+    connect(exportAction, &QAction::triggered, this, [this, path]() {
+        emit exportCategoriesRequested(path);
+    });
+
+    // "Copy Path" — available for any folder
+    QAction *copyPathAction = contextMenu.addAction(tr("复制路径"));
+    copyPathAction->setObjectName(QStringLiteral("copyFolderPathAction"));
+    copyPathAction->setEnabled(!path.isEmpty());
+    connect(copyPathAction, &QAction::triggered, this, [path]() {
+        if (path.isEmpty()) {
+            return;
+        }
+        if (QClipboard *clipboard = QGuiApplication::clipboard()) {
+            clipboard->setText(QDir::toNativeSeparators(path));
+        }
+    });
+
+    contextMenu.addSeparator();
+
+    // "Refresh" — available for any folder
+    QAction *refreshAction = contextMenu.addAction(tr("Refresh"));
+    connect(refreshAction, &QAction::triggered, this, [this, index]() {
+        m_folderModel->refreshFolder(index);
+    });
+
+    // "Delete" — only for root folders
+    if (isRoot) {
+        QAction *deleteAction = contextMenu.addAction(tr("Delete"));
+        connect(deleteAction, &QAction::triggered, this, [this, index]() {
+            m_folderModel->removeFolder(index);
+            saveFolderList();
+            syncRootList();
+        });
+    }
+
+    contextMenu.exec(m_treeView->viewport()->mapToGlobal(pos));
+}
+
+void FolderPanel::saveFolderList()
+{
+    if (m_settingsManager) {
+        m_settingsManager->saveFolderList(m_folderModel->rootFolderPaths());
+    }
+}
+
+void FolderPanel::restoreFolderList()
+{
+    if (m_settingsManager) {
+        QStringList folders = m_settingsManager->loadFolderList();
+        m_folderModel->setRootFolders(folders);
+        syncRootList();
+    }
+}
+
+void FolderPanel::syncRootList()
+{
+    if (!m_statusLabel) {
+        return;
+    }
+
+    const QStringList roots = m_folderModel->rootFolderPaths();
+    m_statusLabel->setText(tr("● 已选 %1 个文件夹").arg(roots.size()));
+}

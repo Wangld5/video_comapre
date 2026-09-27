@@ -1,0 +1,30 @@
+# Build directories
+build/
+build-*/
+cmake-build-*/
+build_vs/
+
+# IDE files
+.idea/
+.vscode/
+*.user
+*.swp
+*.swo
+*~
+
+# Claude Code local state (settings + worktrees)
+.claude/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Compiled objects
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe

@@ -1,0 +1,523 @@
+#include <QtTest>
+#include <QTemporaryDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QImage>
+#include <QDateTime>
+#include <QVector>
+#include <memory>
+#include <utility>
+
+#include "utils/FileUtils.h"
+
+class tst_FileUtils : public QObject
+{
+    Q_OBJECT
+
+private slots:
+    void initTestCase();
+
+    void testIsImageFile();
+    void testIsImageFile_nonImage();
+    void testIsImageFile_nonExistent();
+    void testIsImageFile_caseInsensitive();
+    void testIsVideoFile();
+    void testSupportedMediaExtensions();
+
+    void testScanForImages_empty();
+    void testScanForImages_flat();
+    void testScanForImages_recursive();
+    void testScanForImages_nonRecursive();
+    void testScanForImages_nonExistentDir();
+    void testScanForImages_sorted();
+    void testScanForImagesBatched_batches();
+    void testScanForImagesBatched_initialBatchFlushesEarly();
+    void testScanForImagesBatched_cancel();
+    void testScanForImagesBatched_preCancelledSkipsCallbacks();
+    void testScanForImagesBatched_deliversValidMtime();
+    void testScanForImagesBatched_fastMetadataSkipsMtime();
+    void testScanForImagesBatched_deliversAllAcrossBatches();
+    void testScanFindsUppercaseExtensions();
+
+    void testGetSubdirectories();
+    void testGetSubdirectories_empty();
+    void testGetSubdirectories_nonExistent();
+
+    void testSupportedExtensions();
+
+private:
+    QTemporaryDir m_tempDir;
+
+    void createTestFile(const QString &relativePath, bool asImage = false);
+    void createTestDir(const QString &relativePath);
+};
+
+void tst_FileUtils::initTestCase()
+{
+    QVERIFY(m_tempDir.isValid());
+
+    // Create test directory structure:
+    //   root/
+    //     image1.png
+    //     image2.jpg
+    //     image3.bmp
+    //     document.txt
+    //     readme.md
+    //     subdir/
+    //       image4.png
+    //       image5.tiff
+    //       data.csv
+    //       nested/
+    //         image6.jpeg
+
+    createTestDir("subdir");
+    createTestDir("subdir/nested");
+    createTestDir("emptydir");
+
+    createTestFile("image1.png", true);
+    createTestFile("image2.jpg", true);
+    createTestFile("image3.bmp", true);
+    createTestFile("document.txt");
+    createTestFile("readme.md");
+    createTestFile("subdir/image4.png", true);
+    createTestFile("subdir/image5.tiff", true);
+    createTestFile("subdir/data.csv");
+    createTestFile("subdir/nested/image6.jpeg", true);
+}
+
+void tst_FileUtils::createTestFile(const QString &relativePath, bool asImage)
+{
+    QString fullPath = m_tempDir.filePath(relativePath);
+    if (asImage) {
+        // Create a small valid image
+        QImage img(4, 4, QImage::Format_ARGB32);
+        img.fill(Qt::red);
+        img.save(fullPath);
+    } else {
+        QFile file(fullPath);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.write("test content");
+        file.close();
+    }
+}
+
+void tst_FileUtils::createTestDir(const QString &relativePath)
+{
+    QDir dir(m_tempDir.path());
+    QVERIFY(dir.mkpath(relativePath));
+}
+
+void tst_FileUtils::testIsImageFile()
+{
+    QVERIFY(FileUtils::isImageFile(m_tempDir.filePath("image1.png")));
+    QVERIFY(FileUtils::isImageFile(m_tempDir.filePath("image2.jpg")));
+    QVERIFY(FileUtils::isImageFile(m_tempDir.filePath("image3.bmp")));
+}
+
+void tst_FileUtils::testIsImageFile_nonImage()
+{
+    QVERIFY(!FileUtils::isImageFile(m_tempDir.filePath("document.txt")));
+    QVERIFY(!FileUtils::isImageFile(m_tempDir.filePath("readme.md")));
+}
+
+void tst_FileUtils::testIsImageFile_nonExistent()
+{
+    QVERIFY(!FileUtils::isImageFile(m_tempDir.filePath("nonexistent.png")));
+}
+
+void tst_FileUtils::testIsImageFile_caseInsensitive()
+{
+    // Create a file with uppercase extension
+    QString path = m_tempDir.filePath("UPPER.PNG");
+    QImage img(4, 4, QImage::Format_ARGB32);
+    img.fill(Qt::blue);
+    img.save(path);
+
+    QVERIFY(FileUtils::isImageFile(path));
+}
+
+void tst_FileUtils::testIsVideoFile()
+{
+    const QString path = m_tempDir.filePath("clip.MP4");
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    file.close();
+
+    QVERIFY(FileUtils::isVideoFile(path));
+    QVERIFY(!FileUtils::isVideoFile(m_tempDir.filePath("image1.png")));
+    QVERIFY(!FileUtils::isVideoFile(m_tempDir.filePath("missing.mp4")));
+}
+
+void tst_FileUtils::testSupportedMediaExtensions()
+{
+    const QStringList extensions = FileUtils::supportedMediaExtensions();
+    QVERIFY(extensions.contains(QStringLiteral("png")));
+    QVERIFY(extensions.contains(QStringLiteral("mp4")));
+    QVERIFY(!extensions.contains(QStringLiteral("txt")));
+}
+
+void tst_FileUtils::testScanForImages_empty()
+{
+    QStringList result = FileUtils::scanForImages(m_tempDir.filePath("emptydir"));
+    QVERIFY(result.isEmpty());
+}
+
+void tst_FileUtils::testScanForImages_flat()
+{
+    QStringList result = FileUtils::scanForImages(m_tempDir.path(), false);
+    // Should find image1.png, image2.jpg, image3.bmp (and possibly UPPER.PNG from earlier test)
+    QVERIFY(result.size() >= 3);
+
+    // Should NOT contain subdir images
+    for (const QString &path : result) {
+        QVERIFY(!path.contains("subdir"));
+    }
+}
+
+void tst_FileUtils::testScanForImages_recursive()
+{
+    QStringList result = FileUtils::scanForImages(m_tempDir.path(), true);
+    // Should find all image files including subdirectories
+    QVERIFY(result.size() >= 6);
+
+    // Should contain the nested image
+    bool foundNested = false;
+    for (const QString &path : result) {
+        if (path.contains("nested") && path.contains("image6")) {
+            foundNested = true;
+            break;
+        }
+    }
+    QVERIFY(foundNested);
+}
+
+void tst_FileUtils::testScanForImages_nonRecursive()
+{
+    QStringList result = FileUtils::scanForImages(m_tempDir.path(), false);
+    for (const QString &path : result) {
+        QVERIFY(!path.contains("subdir"));
+    }
+}
+
+void tst_FileUtils::testScanForImages_nonExistentDir()
+{
+    QStringList result = FileUtils::scanForImages("/nonexistent/path/12345");
+    QVERIFY(result.isEmpty());
+}
+
+void tst_FileUtils::testScanForImages_sorted()
+{
+    QStringList result = FileUtils::scanForImages(m_tempDir.path(), true);
+    QStringList sorted = result;
+    std::sort(sorted.begin(), sorted.end());
+    QCOMPARE(result, sorted);
+}
+
+void tst_FileUtils::testScanForImagesBatched_batches()
+{
+    QStringList all;
+    int progressUpdates = 0;
+    FileUtils::ScanOptions options;
+    options.recursive = true;
+    options.batchSize = 2;
+    options.initialBatchSize = 1;
+
+    FileUtils::scanForImagesBatched(
+        m_tempDir.path(),
+        options,
+        [&all](const QVector<FileUtils::ScannedImage> &batch, bool /*initialBatch*/) {
+            for (const FileUtils::ScannedImage &item : batch) {
+                all.append(item.path);
+            }
+        },
+        [&progressUpdates](const FileUtils::ScanProgress &progress) {
+            ++progressUpdates;
+            if (progress.finished) {
+                QVERIFY(progress.discoveredCount >= 6);
+            }
+        });
+
+    QVERIFY(all.size() >= 6);
+    QVERIFY(progressUpdates > 0);
+}
+
+void tst_FileUtils::testScanForImagesBatched_initialBatchFlushesEarly()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    for (int i = 0; i < 5; ++i) {
+        QImage img(4, 4, QImage::Format_ARGB32);
+        img.fill(Qt::red);
+        QVERIFY(img.save(dir.filePath(QString("initial_%1.png").arg(i))));
+    }
+
+    QList<int> batchSizes;
+    QList<bool> initialFlags;
+    FileUtils::ScanOptions options;
+    options.recursive = false;
+    options.batchSize = 10;
+    options.initialBatchSize = 2;
+
+    FileUtils::scanForImagesBatched(
+        dir.path(),
+        options,
+        [&batchSizes, &initialFlags](const QVector<FileUtils::ScannedImage> &batch, bool initialBatch) {
+            batchSizes.append(static_cast<int>(batch.size()));
+            initialFlags.append(initialBatch);
+        });
+
+    QCOMPARE(batchSizes.size(), 2);
+    QCOMPARE(batchSizes.at(0), 2);
+    QVERIFY(initialFlags.at(0));
+    QCOMPARE(batchSizes.at(1), 3);
+    QVERIFY(!initialFlags.at(1));
+}
+
+void tst_FileUtils::testScanForImagesBatched_cancel()
+{
+    for (int i = 0; i < 60; ++i) {
+        createTestFile(QString("cancel_%1.png").arg(i), true);
+    }
+
+    QStringList all;
+    auto token = std::make_shared<FileUtils::ScanCancelToken>();
+    FileUtils::ScanOptions options;
+    options.recursive = false;
+    options.batchSize = 5;
+    options.initialBatchSize = 5;
+
+    bool cancelledEarly = false;
+    FileUtils::scanForImagesBatched(
+        m_tempDir.path(),
+        options,
+        [&all, &token, &cancelledEarly](const QVector<FileUtils::ScannedImage> &batch, bool /*initialBatch*/) {
+            for (const FileUtils::ScannedImage &item : batch) {
+                all.append(item.path);
+            }
+            if (all.size() >= 10 && !token->isCancelled()) {
+                token->cancel();
+                cancelledEarly = true;
+            }
+        },
+        {},
+        token);
+
+    QVERIFY(cancelledEarly);
+    QVERIFY(all.size() < 60);
+}
+
+void tst_FileUtils::testScanForImagesBatched_preCancelledSkipsCallbacks()
+{
+    auto token = std::make_shared<FileUtils::ScanCancelToken>();
+    token->cancel();
+
+    int batchCallbacks = 0;
+    int progressCallbacks = 0;
+    FileUtils::scanForImagesBatched(
+        m_tempDir.path(),
+        FileUtils::ScanOptions{},
+        [&batchCallbacks](const QVector<FileUtils::ScannedImage> &, bool) {
+            ++batchCallbacks;
+        },
+        [&progressCallbacks](const FileUtils::ScanProgress &) {
+            ++progressCallbacks;
+        },
+        token);
+
+    QCOMPARE(batchCallbacks, 0);
+    QCOMPARE(progressCallbacks, 0);
+}
+
+void tst_FileUtils::testScanForImagesBatched_deliversValidMtime()
+{
+    QVector<FileUtils::ScannedImage> all;
+    FileUtils::ScanOptions options;
+    options.recursive = true;
+    options.batchSize = 4;
+    options.initialBatchSize = 2;
+
+    FileUtils::scanForImagesBatched(
+        m_tempDir.path(),
+        options,
+        [&all](const QVector<FileUtils::ScannedImage> &batch, bool /*initialBatch*/) {
+            all.append(batch);
+        });
+
+    QVERIFY(all.size() >= 6);
+    for (const FileUtils::ScannedImage &item : all) {
+        QVERIFY(!item.path.isEmpty());
+        QVERIFY2(item.lastModifiedUtc.isValid(),
+                 qPrintable(QStringLiteral("invalid mtime for %1").arg(item.path)));
+        QCOMPARE(item.lastModifiedUtc.timeSpec(), Qt::UTC);
+        // The scan-time mtime must match a direct stat of the same file
+        // (allow a couple of seconds for filesystem timestamp granularity).
+        const QDateTime direct = QFileInfo(item.path).lastModified().toUTC();
+        QVERIFY(qAbs(item.lastModifiedUtc.secsTo(direct)) <= 2);
+    }
+}
+
+void tst_FileUtils::testScanForImagesBatched_fastMetadataSkipsMtime()
+{
+    QVector<FileUtils::ScannedImage> all;
+    FileUtils::ScanOptions options;
+    options.recursive = false;
+    options.captureLastModified = false;
+    options.batchSize = 8;
+
+    FileUtils::scanForImagesBatched(
+        m_tempDir.path(), options,
+        [&all](const QVector<FileUtils::ScannedImage> &batch, bool) {
+            all.append(batch);
+        });
+
+    QVERIFY(!all.isEmpty());
+    for (const FileUtils::ScannedImage &item : std::as_const(all)) {
+        QVERIFY(!item.fileName.isEmpty());
+        QCOMPARE(QFileInfo(item.path).fileName(), item.fileName);
+        QVERIFY(!item.lastModifiedUtc.isValid());
+    }
+}
+
+void tst_FileUtils::testScanForImagesBatched_deliversAllAcrossBatches()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    // The scan delivers in discovery order (ImageListModel sorts once the scan
+    // completes), so this guards the scan's actual contract: every discovered file
+    // is handed back exactly once -- none dropped or duplicated -- even when the
+    // listing spans many batches.
+    const int fileCount = 40;
+    QStringList expected;
+    for (int i = 0; i < fileCount; ++i) {
+        const int n = (i * 17 + 3) % fileCount; // permutation of 0..39 -> shuffled creation order
+        const QString name = QStringLiteral("img_%1.png").arg(n, 3, 10, QChar('0'));
+        QImage img(4, 4, QImage::Format_ARGB32);
+        img.fill(Qt::red);
+        QVERIFY(img.save(dir.filePath(name)));
+        expected.append(dir.filePath(name));
+    }
+    std::sort(expected.begin(), expected.end());
+
+    QStringList delivered;
+    int batchCount = 0;
+    FileUtils::ScanOptions options;
+    options.recursive = false;
+    options.batchSize = 8;
+    options.initialBatchSize = 4;
+
+    FileUtils::scanForImagesBatched(
+        dir.path(),
+        options,
+        [&delivered, &batchCount](const QVector<FileUtils::ScannedImage> &batch, bool /*initialBatch*/) {
+            ++batchCount;
+            for (const FileUtils::ScannedImage &item : batch) {
+                delivered.append(item.path);
+            }
+        });
+
+    QVERIFY2(batchCount > 1, "test must span multiple batches");
+    QCOMPARE(delivered.size(), fileCount);
+    std::sort(delivered.begin(), delivered.end());
+    QCOMPARE(delivered, expected);
+}
+
+void tst_FileUtils::testScanFindsUppercaseExtensions()
+{
+    // Regression guard: the scan must match extensions case-insensitively
+    // (like isImageFile), or uppercase/mixed-case files straight from cameras
+    // (IMG.JPG, scan.PNG, photo.Jpeg) are silently skipped on case-sensitive
+    // filesystems (Linux, case-sensitive macOS volumes). The earlier glob-based
+    // name filters were case-sensitive there.
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    const QStringList imageNames = {
+        QStringLiteral("PHOTO.JPG"),
+        QStringLiteral("scan.PNG"),
+        QStringLiteral("Mixed.Jpeg"),
+        QStringLiteral("upper.TIFF"),
+        QStringLiteral("lower.png"),
+    };
+    for (const QString &name : imageNames) {
+        QImage img(4, 4, QImage::Format_ARGB32);
+        img.fill(Qt::green);
+        QVERIFY(img.save(dir.filePath(name)));
+    }
+    // A non-image with an uppercase extension must still be excluded.
+    {
+        QFile f(dir.filePath(QStringLiteral("notes.TXT")));
+        QVERIFY(f.open(QIODevice::WriteOnly));
+        f.write("x");
+        f.close();
+    }
+
+    // scanForImages
+    const QStringList scanned = FileUtils::scanForImages(dir.path(), false);
+    QCOMPARE(scanned.size(), imageNames.size());
+    for (const QString &name : imageNames) {
+        QVERIFY2(scanned.contains(dir.filePath(name)),
+                 qPrintable(QStringLiteral("scanForImages missed %1").arg(name)));
+    }
+    for (const QString &p : scanned) {
+        QVERIFY(!p.endsWith(QStringLiteral("notes.TXT")));
+    }
+
+    // scanForImagesBatched (the production path used by ImageListModel)
+    QStringList batched;
+    FileUtils::ScanOptions options;
+    options.recursive = false;
+    FileUtils::scanForImagesBatched(
+        dir.path(), options,
+        [&batched](const QVector<FileUtils::ScannedImage> &batch, bool /*initial*/) {
+            for (const FileUtils::ScannedImage &item : batch) {
+                batched.append(item.path);
+            }
+        });
+    QCOMPARE(batched.size(), imageNames.size());
+    for (const QString &name : imageNames) {
+        QVERIFY2(batched.contains(dir.filePath(name)),
+                 qPrintable(QStringLiteral("scanForImagesBatched missed %1").arg(name)));
+    }
+}
+
+void tst_FileUtils::testGetSubdirectories()
+{
+    QStringList result = FileUtils::getSubdirectories(m_tempDir.path());
+    QVERIFY(result.size() >= 2); // emptydir and subdir at minimum
+
+    bool foundSubdir = false;
+    bool foundEmptydir = false;
+    for (const QString &path : result) {
+        if (path.endsWith("subdir")) foundSubdir = true;
+        if (path.endsWith("emptydir")) foundEmptydir = true;
+    }
+    QVERIFY(foundSubdir);
+    QVERIFY(foundEmptydir);
+}
+
+void tst_FileUtils::testGetSubdirectories_empty()
+{
+    QStringList result = FileUtils::getSubdirectories(m_tempDir.filePath("emptydir"));
+    QVERIFY(result.isEmpty());
+}
+
+void tst_FileUtils::testGetSubdirectories_nonExistent()
+{
+    QStringList result = FileUtils::getSubdirectories("/nonexistent/path/12345");
+    QVERIFY(result.isEmpty());
+}
+
+void tst_FileUtils::testSupportedExtensions()
+{
+    QStringList exts = FileUtils::supportedImageExtensions();
+    QVERIFY(exts.contains("png"));
+    QVERIFY(exts.contains("jpg"));
+    QVERIFY(exts.contains("jpeg"));
+    QVERIFY(exts.contains("bmp"));
+    QVERIFY(exts.contains("tiff"));
+}
+
+QTEST_MAIN(tst_FileUtils)
+#include "tst_FileUtils.moc"

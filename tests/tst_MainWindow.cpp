@@ -1,0 +1,317 @@
+#include <QTest>
+#include <QAbstractItemView>
+#include <QAction>
+#include <QImage>
+#include <QListView>
+#include <QPushButton>
+#include <QSplitter>
+#include <QTemporaryDir>
+#include <QToolButton>
+#include <algorithm>
+
+#include "app/MainWindow.h"
+#include "models/CompareSession.h"
+#include "models/ImageListModel.h"
+#include "widgets/BrowsePanel.h"
+#include "widgets/ComparePanel.h"
+#include "widgets/VlmAnnotationDialog.h"
+
+class tst_MainWindow : public QObject
+{
+    Q_OBJECT
+
+private slots:
+    void commandBar_removesDeadMenuAndBrowseButtons();
+    void commandBar_includesAiAnnotationButton();
+    void vlmAnnotationDialog_opensModelessAndReusesWindow();
+    void commandBar_compareModeButtonsControlComparePanel();
+    void commandBar_reverseSwapDirectionControlsComparePanel();
+    void commandBar_imageNameOverlayControlsComparePanel();
+    void directionKeys_navigateBrowseSelection();
+    void browsePanel_notCollapsibleButHidableByToggle();
+
+private:
+    static QList<QListView *> sortedViews(BrowsePanel &panel);
+    static void waitForRows(QListView *view, int rows);
+    static void clickRow(QListView *view, int row);
+    static bool isRowSelected(QListView *view, int row);
+};
+
+QList<QListView *> tst_MainWindow::sortedViews(BrowsePanel &panel)
+{
+    auto views = panel.findChildren<QListView *>(QStringLiteral("compareColumnListView"));
+    std::sort(views.begin(), views.end(), [&panel](QListView *lhs, QListView *rhs) {
+        return lhs->mapTo(&panel, QPoint(0, 0)).x() < rhs->mapTo(&panel, QPoint(0, 0)).x();
+    });
+    return views;
+}
+
+void tst_MainWindow::waitForRows(QListView *view, int rows)
+{
+    QVERIFY(view != nullptr);
+    QTRY_COMPARE_WITH_TIMEOUT(view->model()->rowCount(), rows, 8000);
+}
+
+void tst_MainWindow::clickRow(QListView *view, int row)
+{
+    QVERIFY(view != nullptr);
+    auto *model = view->model();
+    QVERIFY(model != nullptr);
+    QVERIFY(row >= 0 && row < model->rowCount());
+
+    const QModelIndex index = model->index(row, 0);
+    view->scrollTo(index, QAbstractItemView::PositionAtCenter);
+    QTest::qWait(30);
+
+    const QRect rect = view->visualRect(index);
+    QVERIFY2(rect.isValid(), qPrintable(QString("invalid visual rect for row %1").arg(row)));
+    QTest::mouseClick(view->viewport(), Qt::LeftButton, Qt::NoModifier, rect.center());
+}
+
+bool tst_MainWindow::isRowSelected(QListView *view, int row)
+{
+    auto *model = qobject_cast<ImageListModel *>(view ? view->model() : nullptr);
+    if (!model || row < 0 || row >= model->imageCount()) {
+        return false;
+    }
+    return model->isSelected(row);
+}
+
+void tst_MainWindow::commandBar_removesDeadMenuAndBrowseButtons()
+{
+    MainWindow window;
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+
+    QStringList commandTexts;
+    const auto buttons = window.findChildren<QToolButton *>(
+        QStringLiteral("commandButton"));
+    for (QToolButton *button : buttons) {
+        commandTexts.append(button->text());
+    }
+
+    QVERIFY(!commandTexts.contains(QStringLiteral("☰")));
+    QVERIFY(!commandTexts.contains(QStringLiteral("▦  浏览")));
+    QVERIFY(!commandTexts.contains(QStringLiteral("⚙  设置")));
+    QVERIFY(!commandTexts.contains(QStringLiteral("⋮")));
+    QVERIFY(commandTexts.contains(QStringLiteral("↑  上一张")));
+    QVERIFY(commandTexts.contains(QStringLiteral("↓  下一张")));
+}
+
+void tst_MainWindow::commandBar_includesAiAnnotationButton()
+{
+    MainWindow window;
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+
+    QStringList commandTexts;
+    const auto buttons = window.findChildren<QToolButton *>(
+        QStringLiteral("commandButton"));
+    for (QToolButton *button : buttons) {
+        commandTexts.append(button->text());
+    }
+
+    QVERIFY(commandTexts.contains(QStringLiteral("AI 标注")));
+    QVERIFY(commandTexts.contains(QStringLiteral("设置")));
+    QVERIFY(!commandTexts.contains(QStringLiteral("VLM 设置")));
+}
+
+void tst_MainWindow::vlmAnnotationDialog_opensModelessAndReusesWindow()
+{
+    MainWindow window;
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+
+    QToolButton *annotationButton = nullptr;
+    const auto buttons = window.findChildren<QToolButton *>(
+        QStringLiteral("commandButton"));
+    for (QToolButton *button : buttons) {
+        if (button->text() == QStringLiteral("AI 标注")) {
+            annotationButton = button;
+            break;
+        }
+    }
+    QVERIFY(annotationButton != nullptr);
+
+    QTest::mouseClick(annotationButton, Qt::LeftButton);
+
+    VlmAnnotationDialog *dialog = nullptr;
+    QTRY_VERIFY_WITH_TIMEOUT((dialog = window.findChild<VlmAnnotationDialog *>()) != nullptr, 1000);
+    QVERIFY(!dialog->isModal());
+    QCOMPARE(dialog->windowModality(), Qt::NonModal);
+    QVERIFY(dialog->windowFlags() & Qt::WindowMinimizeButtonHint);
+    QVERIFY(window.isEnabled());
+
+    auto *minimizeButton = dialog->findChild<QPushButton *>(QStringLiteral("vlmMinimizeButton"));
+    QVERIFY(minimizeButton != nullptr);
+    QVERIFY(minimizeButton->isEnabled());
+
+    QTest::mouseClick(annotationButton, Qt::LeftButton);
+    QCOMPARE(window.findChildren<VlmAnnotationDialog *>().size(), 1);
+
+    dialog->close();
+}
+
+void tst_MainWindow::commandBar_compareModeButtonsControlComparePanel()
+{
+    MainWindow window;
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+
+    auto *comparePanel = window.findChild<ComparePanel *>();
+    QVERIFY(comparePanel != nullptr);
+    QCOMPARE(comparePanel->compareMode(), ComparePanel::SwapMode);
+
+    QToolButton *toleranceButton = nullptr;
+    QToolButton *swapButton = nullptr;
+    const auto buttons = window.findChildren<QToolButton *>(
+        QStringLiteral("commandButton"));
+    for (QToolButton *button : buttons) {
+        if (button->text() == QStringLiteral("容差图")) {
+            toleranceButton = button;
+        } else if (button->text() == QStringLiteral("交换")) {
+            swapButton = button;
+        }
+    }
+    QVERIFY(toleranceButton != nullptr);
+    QVERIFY(swapButton != nullptr);
+
+    QTest::mouseClick(toleranceButton, Qt::LeftButton);
+    QCOMPARE(comparePanel->compareMode(), ComparePanel::ToleranceMode);
+
+    QTest::mouseClick(swapButton, Qt::LeftButton);
+    QCOMPARE(comparePanel->compareMode(), ComparePanel::SwapMode);
+}
+
+void tst_MainWindow::commandBar_reverseSwapDirectionControlsComparePanel()
+{
+    MainWindow window;
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+
+    auto *comparePanel = window.findChild<ComparePanel *>();
+    QVERIFY(comparePanel != nullptr);
+
+    QToolButton *reverseButton = nullptr;
+    const auto buttons = window.findChildren<QToolButton *>(
+        QStringLiteral("commandButton"));
+    for (QToolButton *button : buttons) {
+        if (button->text() == QStringLiteral("反向交换")) {
+            reverseButton = button;
+            break;
+        }
+    }
+    QVERIFY(reverseButton != nullptr);
+    QCOMPARE(reverseButton->isChecked(), comparePanel->reverseSwapDirectionEnabled());
+
+    const bool originalDirection = comparePanel->reverseSwapDirectionEnabled();
+    QTest::mouseClick(reverseButton, Qt::LeftButton);
+    QCOMPARE(comparePanel->reverseSwapDirectionEnabled(), !originalDirection);
+    QCOMPARE(reverseButton->isChecked(), !originalDirection);
+}
+
+void tst_MainWindow::commandBar_imageNameOverlayControlsComparePanel()
+{
+    MainWindow window;
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+
+    auto *comparePanel = window.findChild<ComparePanel *>();
+    QVERIFY(comparePanel != nullptr);
+
+    QToolButton *overlayButton = nullptr;
+    const auto buttons = window.findChildren<QToolButton *>(
+        QStringLiteral("commandButton"));
+    for (QToolButton *button : buttons) {
+        if (button->text() == QStringLiteral("名称标注")) {
+            overlayButton = button;
+            break;
+        }
+    }
+    QVERIFY(overlayButton != nullptr);
+    QCOMPARE(overlayButton->isChecked(), comparePanel->imageNameOverlayEnabled());
+
+    const bool originallyEnabled = comparePanel->imageNameOverlayEnabled();
+    QTest::mouseClick(overlayButton, Qt::LeftButton);
+    QCOMPARE(comparePanel->imageNameOverlayEnabled(), !originallyEnabled);
+    QCOMPARE(overlayButton->isChecked(), !originallyEnabled);
+}
+
+void tst_MainWindow::directionKeys_navigateBrowseSelection()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    QImage image(16, 16, QImage::Format_ARGB32);
+    image.fill(Qt::yellow);
+    QVERIFY(image.save(dir.filePath("img_00.png")));
+    QVERIFY(image.save(dir.filePath("img_01.png")));
+
+    MainWindow window;
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+
+    auto *session = window.findChild<CompareSession *>();
+    auto *browsePanel = window.findChild<BrowsePanel *>();
+    QVERIFY(session != nullptr);
+    QVERIFY(browsePanel != nullptr);
+
+    QVERIFY(session->addFolder(dir.path()));
+
+    QList<QListView *> views;
+    QTRY_VERIFY_WITH_TIMEOUT((views = sortedViews(*browsePanel), views.size() == 1), 5000);
+    waitForRows(views[0], 2);
+
+    clickRow(views[0], 0);
+    QTRY_VERIFY_WITH_TIMEOUT(isRowSelected(views[0], 0), 1000);
+
+    views[0]->setFocus();
+    QTest::keyClick(views[0], Qt::Key_Down);
+    QTRY_VERIFY_WITH_TIMEOUT(isRowSelected(views[0], 1), 1000);
+
+    QTest::keyClick(views[0], Qt::Key_Up);
+    QTRY_VERIFY_WITH_TIMEOUT(isRowSelected(views[0], 0), 1000);
+}
+
+void tst_MainWindow::browsePanel_notCollapsibleButHidableByToggle()
+{
+    MainWindow window;
+    window.resize(1680, 940);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+
+    auto *splitter = window.findChild<QSplitter *>(QStringLiteral("contentSplitter"));
+    QVERIFY(splitter != nullptr);
+    auto *browse = window.findChild<BrowsePanel *>();
+    QVERIFY(browse != nullptr);
+
+    // Dragging the handle to the edge must NOT collapse the browse panel; it stops
+    // at the panel's minimum (the thumbnails just reach their minimum size).
+    QVERIFY(!splitter->isCollapsible(1));
+    QVERIFY(!browse->isHidden());
+    QVERIFY(splitter->sizes().at(1) > 0);
+
+    QAction *toggle = nullptr;
+    const QList<QAction *> actions = window.findChildren<QAction *>();
+    for (QAction *action : actions) {
+        if (action->text() == QStringLiteral("Browse Panel")) {
+            toggle = action;
+            break;
+        }
+    }
+    QVERIFY(toggle != nullptr);
+
+    // The toggle still fully hides the panel (it hides the widget rather than
+    // collapsing, which a non-collapsible pane would refuse)...
+    toggle->trigger();
+    QTRY_VERIFY(browse->isHidden());
+    QTRY_COMPARE(splitter->sizes().at(1), 0);
+
+    // ...and restores it (visible, non-zero width).
+    toggle->trigger();
+    QTRY_VERIFY(!browse->isHidden());
+    QTRY_VERIFY(splitter->sizes().at(1) > 0);
+}
+
+QTEST_MAIN(tst_MainWindow)
+#include "tst_MainWindow.moc"
