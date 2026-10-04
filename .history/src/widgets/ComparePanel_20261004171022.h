@@ -1,0 +1,320 @@
+#ifndef COMPAREPANEL_H
+#define COMPAREPANEL_H
+
+#include <QWidget>
+#include <QList>
+#include <QPair>
+#include <QImage>
+#include <QPoint>
+#include <QSize>
+#include <QFutureWatcher>
+#include <QThreadPool>
+
+#include <atomic>
+#include <memory>
+
+class QGridLayout;
+class QSlider;
+class QLabel;
+class QToolBar;
+class QTimer;
+class QAction;
+class QHBoxLayout;
+class QPushButton;
+class QCheckBox;
+class QMediaPlayer;
+class QVideoSink;
+class QVideoFrame;
+class QGraphicsView;
+class QGraphicsVideoItem;
+class FlowLayout;
+class SettingsManager;
+class CompareSession;
+class ZoomableImageWidget;
+class ImageLoader;
+class ImageMarkManager;
+
+/**
+ * @brief Image comparison panel displaying selected images in a grid.
+ *
+ * Maintains one cell per folder in the CompareSession. Each cell provides
+ * compare buttons to trigger operations against other visible images.
+ * Two compare modes:
+ *   - Swap mode (default): press-hold compare button to preview source on target,
+ *     release to restore.
+ *   - Tolerance mode: click compare button to toggle tolerance map on target.
+ *
+ * Supports zoom and pan:
+ *   - Mouse wheel to zoom, drag to pan, double-click to reset.
+ *   - By default, zoom/pan syncs across all images (linked mode).
+ *   - Hold Ctrl to zoom/pan only the current image (independent mode).
+ */
+class ComparePanel : public QWidget
+{
+    Q_OBJECT
+
+public:
+    enum CompareMode {
+        SwapMode,       ///< Press-hold to preview one image on the other (direction configurable)
+        ToleranceMode   ///< Click to toggle tolerance map
+    };
+
+    explicit ComparePanel(CompareSession *session,
+                          SettingsManager *settingsManager,
+                          ImageLoader *imageLoader = nullptr,
+                          QWidget *parent = nullptr);
+    ~ComparePanel() override;
+
+    void setSelectedImages(const QList<QPair<QString, QString>> &selectedImages);
+    void clear();
+    void setImageMarkManager(ImageMarkManager *manager);
+
+    /**
+     * @brief Re-issue load requests for every cell currently displaying an image.
+     *
+     * Used after a configuration change (e.g. ICC strip toggled) that invalidated
+     * the upstream image cache: walks the cell list and re-runs loadImage() for
+     * each non-empty cell so the user sees the new policy applied without
+     * having to re-select images.
+     */
+    void reloadAllImages();
+
+    CompareMode compareMode() const { return m_compareMode; }
+    int comparisonThreshold() const { return m_threshold; }
+    bool resizeToFirstImageEnabled() const { return m_resizeToFirstImageEnabled; }
+    bool reverseSwapDirectionEnabled() const { return m_reverseSwapDirectionEnabled; }
+    bool imageNameOverlayEnabled() const { return m_imageNameOverlayEnabled; }
+    void setCompareMode(CompareMode mode);
+    void setComparisonThreshold(int value);
+    void setResizeToFirstImageEnabled(bool enabled);
+    void setReverseSwapDirectionEnabled(bool enabled);
+    void setImageNameOverlayEnabled(bool enabled);
+    void setControlsVisible(bool visible);
+
+signals:
+    /**
+     * @brief Request navigation to the previous image set.
+     */
+    void navigatePreviousRequested();
+
+    /**
+     * @brief Request navigation to the next image set.
+     */
+    void navigateNextRequested();
+
+    void compareModeChanged(CompareMode mode);
+    void comparisonThresholdChanged(int value);
+    void resizeToFirstImageChanged(bool enabled);
+    void reverseSwapDirectionChanged(bool enabled);
+    void imageNameOverlayChanged(bool enabled);
+
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override;
+    void keyPressEvent(QKeyEvent *event) override;
+    void keyReleaseEvent(QKeyEvent *event) override;
+
+private slots:
+    void onFolderAdded(const QString &folderPath, int index);
+    void onFolderRemoved(const QString &folderPath, int index);
+    void onFoldersSwapped(int firstIndex, int secondIndex);
+    void onSessionCleared();
+    void onComparePressed(int sourceIndex, int targetIndex);
+    void onCompareReleased(int sourceIndex, int targetIndex);
+    void onCompareClicked(int sourceIndex, int targetIndex);
+    void onThresholdChanged(int value);
+    void onModeToggled();
+    void onResizeToFirstImageToggled(bool enabled);
+
+    // Zoom/pan sync slots
+    void onCellZoomChanged(double zoomLevel, QPointF focalPoint);
+    void onCellPanChanged(QPointF normalizedOffset);
+    void onCellViewReset();
+    void onImageReady(const QString &imagePath, const QImage &image);
+    void onThumbnailReady(const QString &imagePath, const QImage &thumbnail);
+    void onMarkChanged(const QString &folderPath,
+                       const QString &imagePath,
+                       const QString &category);
+    void onVideoPositionChanged(qint64 position);
+    void onVideoDurationChanged(qint64 duration);
+    void seekVideos(int position);
+    void toggleVideoPlayback();
+    void stopVideos();
+    void stepVideoFrame(int direction);
+    void toggleVideoDiff(bool enabled);
+
+private:
+    struct ImageCell {
+        QWidget *container = nullptr;
+        QWidget *headerWidget = nullptr;
+        QWidget *imageContainer = nullptr;
+        QLabel *nameOverlayLabel = nullptr;
+        QLabel *indexBadge = nullptr;
+        QLabel *headerLabel = nullptr;
+        QWidget *markButtonsContainer = nullptr;
+        QHBoxLayout *markButtonsLayout = nullptr;
+        QList<QPushButton *> markButtons;
+        QPushButton *renameButton = nullptr;
+        QWidget *compareButtonsContainer = nullptr;
+        FlowLayout *compareButtonsLayout = nullptr;
+        QList<QPushButton *> compareButtons;
+        ZoomableImageWidget *imageWidget = nullptr;
+        QGraphicsView *videoView = nullptr;
+        QGraphicsVideoItem *videoItem = nullptr;
+        QVideoSink *videoSink = nullptr;
+        QMediaPlayer *mediaPlayer = nullptr;
+        QImage currentVideoFrame;
+        qint64 lastDiffFrameCaptureMs = 0;
+        int rotationDegrees = 0;
+        bool pauseAfterFirstFrame = false;
+        QString folderPath;
+        QString imagePath;
+        QString customDisplayName;
+        QImage originalImage;
+        QImage previewImage;
+        QImage cachedToleranceImage;   // Cached tolerance map (full res)
+        int cachedToleranceThreshold = -1;     // Threshold used to build the cache
+        // Cache for imageForCompare()'s resize-to-largest scaling. The first
+        // smooth resample runs in m_resizePool so selecting a large image never
+        // blocks the GUI thread; these keys reject stale completions.
+        QImage resizedCompareImage;
+        qint64 resizedCompareSrcKey = 0;
+        QSize resizedCompareRefSize;
+        QFutureWatcher<QImage> *resizeWatcher = nullptr;
+        std::shared_ptr<std::atomic_bool> resizeCancel;
+        quint64 resizeGeneration = 0;
+        qint64 pendingResizeSrcKey = 0;
+        QSize pendingResizeRefSize;
+        bool resizeRerunRequested = false;
+        QFutureWatcher<QImage> *toleranceWatcher = nullptr; // In-flight async job
+        std::shared_ptr<std::atomic_bool> toleranceCancel;
+        quint64 toleranceGeneration = 0;       // Bumped to invalidate in-flight jobs
+        qint64 pendingToleranceSourceKey = 0;
+        qint64 pendingToleranceTargetKey = 0;
+        int pendingToleranceThreshold = -1;
+        int pendingToleranceSourceIndex = -1;
+        bool toleranceRerunRequested = false;
+        bool hasImage = false;
+        bool isVideo = false;
+        bool showingPreview = false;
+        bool showingToleranceMap = false;
+        int toleranceSourceIndex = -1;
+    };
+
+    void setupUi();
+    ImageCell createCell(const QString &folderPath);
+    void clearCells();
+    void rebuildGrid();
+    void setupCompareButtonsForCell(int cellIndex);
+    void setupMarkButtonsForCell(int cellIndex);
+    void positionMarkButtonsForCell(int cellIndex);
+    void updateMarkButtonsForCell(int cellIndex);
+    void updateAllMarkButtons();
+    void markCell(int cellIndex, const QString &category);
+    void markCurrentImage(const QString &category);
+    void markAllImagesFromShortcut(const QString &category);
+    void markAllCurrentImages(const QString &category);
+    QString markForCell(int cellIndex) const;
+    int currentCellIndex() const;
+    void setCurrentCellIndex(int cellIndex);
+    void updateCurrentCellVisual(int cellIndex);
+    void loadImage(int cellIndex);
+    void preloadImagesForSelection(const QList<QPair<QString, QString>> &selectedImages);
+    void clearImage(int cellIndex);
+    void showPreviewImage(int cellIndex, const QImage &preview, bool resetView = false);
+    void showOriginalImage(int cellIndex, bool resetView = false);
+    void showToleranceMap(int sourceIndex, int targetIndex);
+    void cancelToleranceWatcher(ImageCell &cell);
+    void markToleranceWorkStale(ImageCell &cell, bool rerunLatest);
+    void cancelToleranceJobsDependingOn(int cellIndex);
+    void refreshToleranceJobsDependingOn(int cellIndex);
+    void cancelResizeWatcher(ImageCell &cell);
+    void markResizeWorkStale(ImageCell &cell);
+    void invalidateResizedCompareImage(ImageCell &cell);
+    void ensureResizedCompareImage(int cellIndex);
+    void scheduleResizedCompareImage(int cellIndex,
+                                     const QImage &baseImage,
+                                     const QSize &referenceSize);
+    void showSourceOnTarget(int sourceIndex, int targetIndex);
+    int swapPreviewCellIndex(int sourceIndex, int targetIndex) const;
+    void refreshCellsUsingLargestImage();
+    void resizeImageCell(int cellIndex);
+    void rebuildCompareButtons();
+    int compareTargetIndexForNumberKey(int key) const;
+    bool canHandleNumberCompareShortcut(const QKeyEvent *event) const;
+    bool handleNumberCompareKeyPress(QKeyEvent *event);
+    bool handleNumberCompareKeyRelease(QKeyEvent *event);
+    void finishKeyboardComparePreview();
+    void renameCell(int cellIndex);
+    void updateCellHeader(int cellIndex);
+    void updateImageNameOverlay(int cellIndex);
+    void positionImageNameOverlay(int cellIndex);
+    QString cellDisplayName(int cellIndex) const;
+    QImage baseImageForCell(int cellIndex) const;
+    QSize resizeReferenceSize() const;
+    QImage imageForCompare(int cellIndex) const;
+    void showImageContextMenuForCell(QWidget *cellContainer,
+                                     QWidget *sourceWidget,
+                                     const QPoint &pos);
+    void rotateSelectedMedia(int degrees);
+    void updateVideoControls();
+    void updateVideoDiff();
+    int videoCellIndexForSender(QObject *object) const;
+    int videoMasterIndex() const;
+    void startCellDrag(int cellIndex);
+    int findCellByDragObject(QObject *object) const;
+    bool isCellDragHandle(QObject *object) const;
+
+    /**
+     * @brief Find the cell index by its ZoomableImageWidget pointer.
+     * @return Index, or -1 if not found.
+     */
+    int findCellByWidget(QObject *widget) const;
+
+    CompareSession *m_session = nullptr;
+    ImageLoader *m_imageLoader = nullptr;
+    ImageMarkManager *m_markManager = nullptr;
+    CompareMode m_compareMode = SwapMode;
+    QToolBar *m_toolBar = nullptr;
+    QAction *m_prevAction = nullptr;
+    QAction *m_nextAction = nullptr;
+    QAction *m_modeAction = nullptr;
+    QSlider *m_thresholdSlider = nullptr;
+    QLabel *m_thresholdValueLabel = nullptr;
+    QWidget *m_thresholdContainer = nullptr; // to show/hide threshold controls
+    QAction *m_videoPlayAction = nullptr;
+    QAction *m_videoStopAction = nullptr;
+    QAction *m_videoPrevFrameAction = nullptr;
+    QAction *m_videoNextFrameAction = nullptr;
+    QAction *m_videoDiffAction = nullptr;
+    QAction *m_rotateLeftAction = nullptr;
+    QAction *m_rotateRightAction = nullptr;
+    QSlider *m_videoTimeline = nullptr;
+    QLabel *m_videoFrameLabel = nullptr;
+    QTimer *m_toleranceRefreshTimer = nullptr;
+    QTimer *m_videoDiffTimer = nullptr;
+    std::unique_ptr<QThreadPool> m_resizePool;
+    QCheckBox *m_resizeToFirstImageCheckBox = nullptr;
+    QCheckBox *m_imageNameOverlayCheckBox = nullptr;
+    QWidget *m_gridContainer = nullptr;
+    QGridLayout *m_gridLayout = nullptr;
+    QList<ImageCell> m_cells;
+    SettingsManager *m_settingsManager = nullptr;
+    int m_threshold = 10;
+    bool m_resizeToFirstImageEnabled = false;
+    bool m_reverseSwapDirectionEnabled = false;
+    bool m_imageNameOverlayEnabled = false;
+    bool m_videoSyncing = false;
+    bool m_videoDiffEnabled = false;
+    bool m_videoPlaybackRequested = false;
+    double m_videoFrameRate = 30.0;
+    qint64 m_videoRequestedPosition = -1;
+    bool m_syncingViews = false; ///< Guard to prevent recursive sync loops
+    QPoint m_cellDragStartPos;
+    QObject *m_cellDragSourceObject = nullptr;
+    int m_cellDragSourceIndex = -1;
+    int m_currentCellIndex = -1;
+    int m_keyboardComparePreviewIndex = -1;
+    int m_keyboardCompareKey = 0;
+};
+
+#endif // COMPAREPANEL_H

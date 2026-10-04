@@ -5,6 +5,7 @@
 #include <QList>
 #include <QPair>
 #include <QImage>
+#include <QStringList>
 #include <QPoint>
 #include <QSize>
 #include <QFutureWatcher>
@@ -136,7 +137,8 @@ private slots:
     void onVideoPositionChanged(qint64 position);
     void onVideoDurationChanged(qint64 duration);
     void seekVideos(int position);
-    void toggleVideoPlayback();
+    void playVideos();
+    void pauseVideos();
     void stopVideos();
     void stepVideoFrame(int direction);
     void toggleVideoDiff(bool enabled);
@@ -160,8 +162,12 @@ private:
         QVideoWidget *videoWidget = nullptr;
         QVideoSink *videoSink = nullptr;
         QMediaPlayer *mediaPlayer = nullptr;
+        QFutureWatcher<QImage> *videoFrameWatcher = nullptr;
         QImage currentVideoFrame;
         qint64 lastDiffFrameCaptureMs = 0;
+        bool diffFrameCapturePending = false;
+        int rotationDegrees = 0;
+        bool pauseAfterFirstFrame = false;
         QString folderPath;
         QString imagePath;
         QString customDisplayName;
@@ -251,9 +257,12 @@ private:
     void showImageContextMenuForCell(QWidget *cellContainer,
                                      QWidget *sourceWidget,
                                      const QPoint &pos);
+    void rotateSelectedMedia(int degrees);
     void updateVideoControls();
     void updateVideoDiff();
+    void alignPausedVideosToMaster(int retryCount = 0);
     int videoCellIndexForSender(QObject *object) const;
+    int videoMasterIndex() const;
     void startCellDrag(int cellIndex);
     int findCellByDragObject(QObject *object) const;
     bool isCellDragHandle(QObject *object) const;
@@ -276,14 +285,21 @@ private:
     QLabel *m_thresholdValueLabel = nullptr;
     QWidget *m_thresholdContainer = nullptr; // to show/hide threshold controls
     QAction *m_videoPlayAction = nullptr;
+    QAction *m_videoPauseAction = nullptr;
     QAction *m_videoStopAction = nullptr;
     QAction *m_videoPrevFrameAction = nullptr;
     QAction *m_videoNextFrameAction = nullptr;
     QAction *m_videoDiffAction = nullptr;
+    QAction *m_rotateLeftAction = nullptr;
+    QAction *m_rotateRightAction = nullptr;
     QSlider *m_videoTimeline = nullptr;
     QLabel *m_videoFrameLabel = nullptr;
     QTimer *m_toleranceRefreshTimer = nullptr;
     QTimer *m_videoDiffTimer = nullptr;
+    QTimer *m_videoUiRefreshTimer = nullptr;
+    QFutureWatcher<QList<QImage>> *m_videoDiffWatcher = nullptr;
+    QString m_videoDiffBasePath;
+    QStringList m_videoDiffTargetPaths;
     std::unique_ptr<QThreadPool> m_resizePool;
     QCheckBox *m_resizeToFirstImageCheckBox = nullptr;
     QCheckBox *m_imageNameOverlayCheckBox = nullptr;
@@ -297,6 +313,8 @@ private:
     bool m_imageNameOverlayEnabled = false;
     bool m_videoSyncing = false;
     bool m_videoDiffEnabled = false;
+    bool m_videoDiffRerunRequested = false;
+    bool m_videoPlaybackRequested = false;
     double m_videoFrameRate = 30.0;
     qint64 m_videoRequestedPosition = -1;
     bool m_syncingViews = false; ///< Guard to prevent recursive sync loops

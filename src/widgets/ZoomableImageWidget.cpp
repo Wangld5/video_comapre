@@ -25,6 +25,7 @@ void ZoomableImageWidget::setImage(const QImage &image, bool resetViewState)
         // Reset view to fit-to-view so the image fills the grid cell
         m_zoomLevel = 1.0;
         m_panOffset = QPointF(0.0, 0.0);
+        m_rotationDegrees = 0;
     } else {
         // Keep current zoom/pan, just re-clamp in case the new image has
         // different dimensions
@@ -105,20 +106,68 @@ void ZoomableImageWidget::resetView(bool emitSignal)
     }
 }
 
+void ZoomableImageWidget::rotateBy(int degrees, bool emitSignal)
+{
+    setRotationDegrees(m_rotationDegrees + degrees, emitSignal);
+}
+
+void ZoomableImageWidget::setRotationDegrees(int degrees, bool emitSignal)
+{
+    if (m_image.isNull()) {
+        return;
+    }
+    m_rotationDegrees = degrees % 360;
+    if (m_rotationDegrees < 0) {
+        m_rotationDegrees += 360;
+    }
+    clampPanOffset();
+    update();
+    if (emitSignal) {
+        emit rotationChanged(m_rotationDegrees);
+    }
+}
+
 // ---- Painting ----
 
 double ZoomableImageWidget::fitScale() const
 {
     if (m_image.isNull()) return 1.0;
 
-    double scaleX = static_cast<double>(width()) / m_image.width();
-    double scaleY = static_cast<double>(height()) / m_image.height();
+    const QSizeF displaySize = rotatedImageSize();
+    double scaleX = static_cast<double>(width()) / displaySize.width();
+    double scaleY = static_cast<double>(height()) / displaySize.height();
     return qMin(scaleX, scaleY);
 }
 
 double ZoomableImageWidget::effectiveScale() const
 {
     return fitScale() * m_zoomLevel;
+}
+
+QSizeF ZoomableImageWidget::rotatedImageSize() const
+{
+    if (m_rotationDegrees % 180 == 0) {
+        return QSizeF(m_image.size());
+    }
+    return QSizeF(m_image.height(), m_image.width());
+}
+
+QTransform ZoomableImageWidget::imageToWidgetTransform(bool includePan) const
+{
+    const double scale = effectiveScale();
+    const double panX = includePan ? m_panOffset.x() : 0.0;
+    const double panY = includePan ? m_panOffset.y() : 0.0;
+    const double radians = qDegreesToRadians(double(m_rotationDegrees));
+    const double rotatedPanX = panX * qCos(radians) - panY * qSin(radians);
+    const double rotatedPanY = panX * qSin(radians) + panY * qCos(radians);
+
+    QTransform transform;
+    transform.translate(width() / 2.0, height() / 2.0);
+    transform.translate(rotatedPanX * scale, rotatedPanY * scale);
+    transform.rotate(m_rotationDegrees);
+    transform.scale(scale, scale);
+    transform.translate(-m_image.width() / 2.0, -m_image.height() / 2.0);
+    return transform;
 }
 
 void ZoomableImageWidget::paintEvent(QPaintEvent * /*event*/)
@@ -139,28 +188,11 @@ void ZoomableImageWidget::paintEvent(QPaintEvent * /*event*/)
         return;
     }
 
-    double scale = effectiveScale();
-    double imgW = m_image.width() * scale;
-    double imgH = m_image.height() * scale;
-
-    // Center the image, then apply pan offset (in image pixels, scaled)
-    double ox = (width() - imgW) / 2.0 + m_panOffset.x() * scale;
-    double oy = (height() - imgH) / 2.0 + m_panOffset.y() * scale;
-
-    const QRectF targetRect(ox, oy, imgW, imgH);
-    const QRectF visibleTarget = targetRect.intersected(QRectF(rect()));
-    if (visibleTarget.isEmpty()) {
-        return;
-    }
-
-    // Explicit source clipping prevents the raster backend from sampling the
-    // entire full-resolution image during a deep zoom/pan when only a small
-    // viewport-sized region can contribute pixels.
-    const QRectF sourceRect((visibleTarget.left() - targetRect.left()) / scale,
-                            (visibleTarget.top() - targetRect.top()) / scale,
-                            visibleTarget.width() / scale,
-                            visibleTarget.height() / scale);
-    painter.drawImage(visibleTarget, m_image, sourceRect);
+    painter.save();
+    painter.setClipRect(rect());
+    painter.setTransform(imageToWidgetTransform());
+    painter.drawImage(QPointF(0.0, 0.0), m_image);
+    painter.restore();
 }
 
 // ---- Mouse interaction ----
@@ -168,15 +200,14 @@ void ZoomableImageWidget::paintEvent(QPaintEvent * /*event*/)
 QPointF ZoomableImageWidget::widgetToNormalized(const QPointF &widgetPos) const
 {
     if (m_image.isNull()) return QPointF(0.5, 0.5);
-
-    double scale = effectiveScale();
-    double imgW = m_image.width() * scale;
-    double imgH = m_image.height() * scale;
-    double ox = (width() - imgW) / 2.0 + m_panOffset.x() * scale;
-    double oy = (height() - imgH) / 2.0 + m_panOffset.y() * scale;
-
-    double nx = (widgetPos.x() - ox) / imgW;
-    double ny = (widgetPos.y() - oy) / imgH;
+    bool invertible = false;
+    const QTransform inverse = imageToWidgetTransform().inverted(&invertible);
+    if (!invertible) {
+        return QPointF(0.5, 0.5);
+    }
+    const QPointF imagePoint = inverse.map(widgetPos);
+    double nx = imagePoint.x() / m_image.width();
+    double ny = imagePoint.y() / m_image.height();
     return QPointF(qBound(0.0, nx, 1.0), qBound(0.0, ny, 1.0));
 }
 
@@ -196,13 +227,9 @@ QPointF ZoomableImageWidget::normalizedImageToWidget(const QPointF &normalizedIm
     if (m_image.isNull()) {
         return QPointF(width() / 2.0, height() / 2.0);
     }
-    const double scale = effectiveScale();
-    const double imgW = m_image.width() * scale;
-    const double imgH = m_image.height() * scale;
-    const double ox = (width() - imgW) / 2.0 + m_panOffset.x() * scale;
-    const double oy = (height() - imgH) / 2.0 + m_panOffset.y() * scale;
-    return QPointF(ox + normalizedImage.x() * imgW,
-                   oy + normalizedImage.y() * imgH);
+    return imageToWidgetTransform().map(
+        QPointF(normalizedImage.x() * m_image.width(),
+                normalizedImage.y() * m_image.height()));
 }
 
 void ZoomableImageWidget::applyZoom(double newLevel, const QPointF &anchorWidget)
@@ -214,27 +241,22 @@ void ZoomableImageWidget::applyZoom(double newLevel, const QPointF &anchorWidget
     }
 
     // Image coordinate under the anchor before the zoom change.
-    const double oldScale = effectiveScale();
-    const double oldImgW = m_image.width() * oldScale;
-    const double oldImgH = m_image.height() * oldScale;
-    const double oldOx = (width() - oldImgW) / 2.0 + m_panOffset.x() * oldScale;
-    const double oldOy = (height() - oldImgH) / 2.0 + m_panOffset.y() * oldScale;
-    const double imgX = (anchorWidget.x() - oldOx) / oldScale;
-    const double imgY = (anchorWidget.y() - oldOy) / oldScale;
+    const QPointF normalizedAnchor = widgetToNormalized(anchorWidget);
 
     // Apply new zoom (clamped).
     m_zoomLevel = qBound(kMinZoom, newLevel, kMaxZoom);
 
     // Solve for the pan that keeps (imgX, imgY) under anchorWidget.
     // anchorWidget = newOxNoPan + (m_panOffset + (imgX, imgY)) * newScale
-    const double newScale = effectiveScale();
-    const double newImgW = m_image.width() * newScale;
-    const double newImgH = m_image.height() * newScale;
-    const double newOxNoPan = (width() - newImgW) / 2.0;
-    const double newOyNoPan = (height() - newImgH) / 2.0;
-    const double newPanX = (anchorWidget.x() - newOxNoPan - imgX * newScale) / newScale;
-    const double newPanY = (anchorWidget.y() - newOyNoPan - imgY * newScale) / newScale;
-    m_panOffset = QPointF(newPanX, newPanY);
+    const QPointF imagePoint(normalizedAnchor.x() * m_image.width(),
+                             normalizedAnchor.y() * m_image.height());
+    const QPointF withoutPan = imageToWidgetTransform(false).map(imagePoint);
+    const double scale = effectiveScale();
+    const QPointF rotatedPan((anchorWidget.x() - withoutPan.x()) / scale,
+                             (anchorWidget.y() - withoutPan.y()) / scale);
+    const double radians = qDegreesToRadians(double(m_rotationDegrees));
+    m_panOffset = QPointF(rotatedPan.x() * qCos(radians) + rotatedPan.y() * qSin(radians),
+                          -rotatedPan.x() * qSin(radians) + rotatedPan.y() * qCos(radians));
 
     // At fit-to-view, snap pan back to zero so the image stays centred.
     if (qFuzzyCompare(m_zoomLevel, 1.0)) {
@@ -292,9 +314,11 @@ void ZoomableImageWidget::mouseMoveEvent(QMouseEvent *event)
         QPoint delta = event->pos() - m_lastMousePos;
         m_lastMousePos = event->pos();
 
-        double scale = effectiveScale();
-        // Convert pixel delta to image coordinate delta
-        m_panOffset += QPointF(delta.x() / scale, delta.y() / scale);
+        const double scale = effectiveScale();
+        const QPointF rotatedDelta(delta.x() / scale, delta.y() / scale);
+        const double radians = qDegreesToRadians(double(m_rotationDegrees));
+        m_panOffset += QPointF(rotatedDelta.x() * qCos(radians) + rotatedDelta.y() * qSin(radians),
+                       -rotatedDelta.x() * qSin(radians) + rotatedDelta.y() * qCos(radians));
         clampPanOffset();
         update();
 

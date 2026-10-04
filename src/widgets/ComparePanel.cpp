@@ -40,15 +40,17 @@
 #include <QMediaPlayer>
 #include <QVideoFrame>
 #include <QVideoSink>
+#include <QVideoWidget>
 #include <QSignalBlocker>
 #include <QTimer>
-#include <QVideoWidget>
 #include <QFutureWatcher>
 #include <QFont>
 #include <QPointer>
 #include <QtConcurrent>
+#include <algorithm>
 #include <cmath>
 #include <climits>
+#include <functional>
 #include <utility>
 
 namespace
@@ -145,6 +147,42 @@ ComparePanel::ComparePanel(CompareSession *session,
         m_videoDiffTimer->setInterval(50);
         connect(m_videoDiffTimer, &QTimer::timeout,
             this, &ComparePanel::updateVideoDiff);
+
+            m_videoUiRefreshTimer = new QTimer(this);
+            m_videoUiRefreshTimer->setSingleShot(true);
+            m_videoUiRefreshTimer->setInterval(100);
+            connect(m_videoUiRefreshTimer, &QTimer::timeout,
+                this, &ComparePanel::updateVideoControls);
+
+    m_videoDiffWatcher = new QFutureWatcher<QList<QImage>>(this);
+    connect(m_videoDiffWatcher, &QFutureWatcher<QList<QImage>>::finished,
+            this, [this]() {
+        const QList<QImage> results = m_videoDiffWatcher->result();
+        if (m_videoDiffEnabled && !results.isEmpty()) {
+            for (ImageCell &cell : m_cells) {
+                if (cell.isVideo && cell.imagePath == m_videoDiffBasePath) {
+                    cell.imageWidget->setImage(results.first(), false);
+                    break;
+                }
+            }
+            const int count = qMin(m_videoDiffTargetPaths.size(), results.size() - 1);
+            for (int resultIndex = 0; resultIndex < count; ++resultIndex) {
+                const QString &path = m_videoDiffTargetPaths.at(resultIndex);
+                for (ImageCell &cell : m_cells) {
+                    if (cell.isVideo && cell.imagePath == path) {
+                        cell.imageWidget->setImage(results.at(resultIndex + 1), false);
+                        break;
+                    }
+                }
+            }
+        }
+
+        const bool rerun = m_videoDiffRerunRequested && m_videoDiffEnabled;
+        m_videoDiffRerunRequested = false;
+        if (rerun) {
+            updateVideoDiff();
+        }
+    });
 
     // Make the panel focusable for keyboard navigation
     setFocusPolicy(Qt::StrongFocus);
@@ -425,9 +463,16 @@ void ComparePanel::setupUi()
     m_toolBar->addSeparator();
 
         m_videoPlayAction = m_toolBar->addAction(tr("播放全部视频"));
+        m_videoPlayAction->setObjectName(QStringLiteral("playAllVideosAction"));
         m_videoPlayAction->setEnabled(false);
         connect(m_videoPlayAction, &QAction::triggered,
-            this, &ComparePanel::toggleVideoPlayback);
+            this, &ComparePanel::playVideos);
+
+        m_videoPauseAction = m_toolBar->addAction(tr("暂停全部视频"));
+        m_videoPauseAction->setObjectName(QStringLiteral("pauseAllVideosAction"));
+        m_videoPauseAction->setEnabled(false);
+        connect(m_videoPauseAction, &QAction::triggered,
+            this, &ComparePanel::pauseVideos);
 
             m_videoStopAction = m_toolBar->addAction(tr("停止"));
             m_videoStopAction->setEnabled(false);
@@ -468,15 +513,26 @@ void ComparePanel::setupUi()
                 "QLabel { color: #263241; font-size: 12px; background: transparent; }");
             videoTimelineLayout->addWidget(m_videoFrameLabel, 0);
 
-        m_videoDiffAction = m_toolBar->addAction(tr("帧差异"));
-        m_videoDiffAction->setCheckable(true);
-        m_videoDiffAction->setEnabled(false);
-        connect(m_videoDiffAction, &QAction::toggled,
+    m_videoDiffAction = m_toolBar->addAction(tr("帧差异"));
+    m_videoDiffAction->setCheckable(true);
+    m_videoDiffAction->setEnabled(false);
+    connect(m_videoDiffAction, &QAction::toggled,
             this, &ComparePanel::toggleVideoDiff);
 
-        m_toolBar->addSeparator();
+    m_rotateLeftAction = m_toolBar->addAction(tr("逆时针旋转"));
+    m_rotateLeftAction->setToolTip(tr("Rotate selected image 90 degrees counter-clockwise"));
+    m_rotateLeftAction->setEnabled(false);
+    connect(m_rotateLeftAction, &QAction::triggered,
+            this, [this]() { rotateSelectedMedia(-90); });
 
-    // Mode toggle button — Fluent 2 pill / toggle style
+    m_rotateRightAction = m_toolBar->addAction(tr("顺时针旋转"));
+    m_rotateRightAction->setToolTip(tr("Rotate selected image 90 degrees clockwise"));
+    m_rotateRightAction->setEnabled(false);
+    connect(m_rotateRightAction, &QAction::triggered,
+            this, [this]() { rotateSelectedMedia(90); });
+
+    m_toolBar->addSeparator();
+
     m_modeAction = m_toolBar->addAction(tr("交换"));
     m_modeAction->setToolTip(tr("Click to switch between Swap and Tolerance mode"));
     m_modeAction->setCheckable(true);
@@ -484,24 +540,20 @@ void ComparePanel::setupUi()
 
     m_toolBar->addSeparator();
 
-    // Threshold controls (only visible in Tolerance mode)
     m_thresholdContainer = new QWidget(m_toolBar);
     auto *thresholdLayout = new QHBoxLayout(m_thresholdContainer);
     thresholdLayout->setContentsMargins(0, 0, 0, 0);
     thresholdLayout->setSpacing(8);
-
     auto *thresholdLabel = new QLabel(tr("阈值"), m_thresholdContainer);
     thresholdLabel->setStyleSheet(
         "QLabel { color: #616161; font-size: 12px; background: transparent; }");
     thresholdLayout->addWidget(thresholdLabel);
-
     m_thresholdSlider = new QSlider(Qt::Horizontal, m_thresholdContainer);
     m_thresholdSlider->setRange(0, 255);
     m_thresholdSlider->setValue(m_threshold);
     m_thresholdSlider->setFixedWidth(160);
     m_thresholdSlider->setToolTip(tr("Tolerance map threshold (0-255)"));
     thresholdLayout->addWidget(m_thresholdSlider);
-
     m_thresholdValueLabel = new QLabel(QString("%1").arg(m_threshold), m_thresholdContainer);
     m_thresholdValueLabel->setMinimumWidth(30);
     m_thresholdValueLabel->setStyleSheet(
@@ -1030,37 +1082,89 @@ ComparePanel::ImageCell ComparePanel::createCell(const QString &folderPath)
     cell.videoWidget = new QVideoWidget(cell.imageContainer);
     cell.videoWidget->setAspectRatioMode(Qt::KeepAspectRatio);
     cell.videoWidget->hide();
+    cell.videoWidget->installEventFilter(this);
     cell.mediaPlayer = new QMediaPlayer(cell.container);
     auto *audioOutput = new QAudioOutput(cell.container);
     cell.mediaPlayer->setAudioOutput(audioOutput);
     cell.mediaPlayer->setVideoOutput(cell.videoWidget);
     cell.videoSink = cell.videoWidget->videoSink();
+        cell.videoFrameWatcher = new QFutureWatcher<QImage>(cell.container);
+        connect(cell.videoFrameWatcher, &QFutureWatcher<QImage>::finished,
+                this, [this, sink = cell.videoSink, watcher = cell.videoFrameWatcher]() {
+            const QImage capturedFrame = watcher->result();
+            for (ImageCell &candidate : m_cells) {
+                if (candidate.videoSink != sink) {
+                    continue;
+                }
+                candidate.diffFrameCapturePending = false;
+                if (!m_videoDiffEnabled || capturedFrame.isNull()) {
+                    return;
+                }
+                candidate.currentVideoFrame = capturedFrame;
+                if (m_videoDiffTimer && !m_videoDiffTimer->isActive()) {
+                    m_videoDiffTimer->start();
+                }
+                return;
+            }
+        });
     connect(cell.mediaPlayer, &QMediaPlayer::positionChanged,
             this, &ComparePanel::onVideoPositionChanged);
     connect(cell.mediaPlayer, &QMediaPlayer::durationChanged,
             this, &ComparePanel::onVideoDurationChanged);
+        connect(cell.mediaPlayer, &QMediaPlayer::playbackStateChanged,
+            this, [this](QMediaPlayer::PlaybackState) { updateVideoControls(); });
+        QMediaPlayer *mediaPlayer = cell.mediaPlayer;
+        connect(mediaPlayer, &QMediaPlayer::mediaStatusChanged,
+                this, [this, mediaPlayer](QMediaPlayer::MediaStatus status) {
+            if (status == QMediaPlayer::EndOfMedia &&
+                videoCellIndexForSender(mediaPlayer) == videoMasterIndex()) {
+                const bool anotherVideoIsPlaying = std::any_of(
+                    m_cells.cbegin(), m_cells.cend(), [mediaPlayer](const ImageCell &cell) {
+                        return cell.mediaPlayer != mediaPlayer && cell.isVideo &&
+                            cell.mediaPlayer &&
+                            cell.mediaPlayer->playbackState() == QMediaPlayer::PlayingState;
+                    });
+                if (!anotherVideoIsPlaying) {
+                    m_videoPlaybackRequested = false;
+                }
+            }
+            updateVideoControls();
+        });
     connect(cell.videoSink, &QVideoSink::videoFrameChanged,
             this, [this, sink = cell.videoSink](const QVideoFrame &frame) {
         const qreal frameRate = frame.surfaceFormat().frameRate();
         if (frameRate > 0.0 && frameRate < 240.0) {
             m_videoFrameRate = frameRate;
         }
-        if (!m_videoDiffEnabled) {
-            return;
-        }
         for (ImageCell &candidate : m_cells) {
             if (candidate.videoSink != sink) {
                 continue;
             }
+            if (candidate.pauseAfterFirstFrame) {
+                candidate.pauseAfterFirstFrame = false;
+                if (candidate.mediaPlayer && candidate.mediaPlayer->audioOutput()) {
+                    candidate.mediaPlayer->audioOutput()->setMuted(false);
+                    candidate.mediaPlayer->pause();
+                }
+            }
+            if (!m_videoDiffEnabled) {
+                break;
+            }
             const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
-            if (nowMs - candidate.lastDiffFrameCaptureMs < 120) {
+            const bool videoIsPlaying = candidate.mediaPlayer &&
+                candidate.mediaPlayer->playbackState() == QMediaPlayer::PlayingState;
+            const qint64 captureIntervalMs = videoIsPlaying ? 500 : 120;
+            if (nowMs - candidate.lastDiffFrameCaptureMs < captureIntervalMs) {
+                break;
+            }
+            if (candidate.diffFrameCapturePending || !candidate.videoFrameWatcher) {
                 break;
             }
             candidate.lastDiffFrameCaptureMs = nowMs;
-            candidate.currentVideoFrame = frame.toImage();
-            if (m_videoDiffTimer && !m_videoDiffTimer->isActive()) {
-                m_videoDiffTimer->start();
-            }
+            candidate.diffFrameCapturePending = true;
+            candidate.videoFrameWatcher->setFuture(QtConcurrent::run([frame]() {
+                return frame.toImage();
+            }));
             break;
         }
     });
@@ -1603,6 +1707,15 @@ void ComparePanel::setCurrentCellIndex(int cellIndex)
     m_currentCellIndex = cellIndex;
     updateCurrentCellVisual(previousIndex);
     updateCurrentCellVisual(m_currentCellIndex);
+    const bool canRotateImage = m_currentCellIndex >= 0 &&
+        !m_cells[m_currentCellIndex].imagePath.isEmpty() &&
+        !m_cells[m_currentCellIndex].isVideo;
+    if (m_rotateLeftAction) {
+        m_rotateLeftAction->setEnabled(canRotateImage);
+    }
+    if (m_rotateRightAction) {
+        m_rotateRightAction->setEnabled(canRotateImage);
+    }
 }
 
 void ComparePanel::updateCurrentCellVisual(int cellIndex)
@@ -1628,15 +1741,19 @@ void ComparePanel::loadImage(int cellIndex)
     cell.isVideo = FileUtils::isVideoFile(cell.imagePath);
     if (cell.isVideo) {
         qint64 synchronizedPosition = 0;
-        bool hasReferenceVideo = false;
-        bool hasPlayingVideo = false;
-        for (const ImageCell &candidate : m_cells) {
+        for (ImageCell &candidate : m_cells) {
             if (&candidate != &cell && candidate.isVideo && candidate.mediaPlayer) {
                 synchronizedPosition = candidate.mediaPlayer->position();
-                hasReferenceVideo = true;
-                hasPlayingVideo = candidate.mediaPlayer->playbackState()
-                    == QMediaPlayer::PlayingState;
                 break;
+            }
+        }
+        for (ImageCell &candidate : m_cells) {
+            if (candidate.isVideo && candidate.mediaPlayer) {
+                candidate.pauseAfterFirstFrame = false;
+                if (candidate.mediaPlayer->audioOutput()) {
+                    candidate.mediaPlayer->audioOutput()->setMuted(false);
+                }
+                candidate.mediaPlayer->pause();
             }
         }
         cell.originalImage = QImage();
@@ -1651,17 +1768,18 @@ void ComparePanel::loadImage(int cellIndex)
         if (synchronizedPosition > 0) {
             cell.mediaPlayer->setPosition(synchronizedPosition);
         }
-        if (!hasReferenceVideo || hasPlayingVideo) {
-            cell.mediaPlayer->play();
-        } else {
-            cell.mediaPlayer->pause();
+        cell.pauseAfterFirstFrame = true;
+        if (cell.mediaPlayer->audioOutput()) {
+            cell.mediaPlayer->audioOutput()->setMuted(true);
         }
+        cell.mediaPlayer->play();
         positionImageNameOverlay(cellIndex);
         updateCellHeader(cellIndex);
         updateVideoControls();
         return;
     }
     cell.isVideo = false;
+    cell.pauseAfterFirstFrame = false;
     cell.videoWidget->hide();
     cell.imageWidget->show();
     cell.compareButtonsContainer->show();
@@ -1787,24 +1905,41 @@ int ComparePanel::videoCellIndexForSender(QObject *object) const
     return -1;
 }
 
+int ComparePanel::videoMasterIndex() const
+{
+    for (int i = 0; i < m_cells.size(); ++i) {
+        if (m_cells[i].isVideo && m_cells[i].mediaPlayer) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 void ComparePanel::updateVideoControls()
 {
     int videoCount = 0;
     qint64 duration = 0;
-    bool playing = false;
+    bool playerIsPlaying = false;
     for (const ImageCell &cell : m_cells) {
         if (!cell.isVideo || !cell.mediaPlayer) {
             continue;
         }
         ++videoCount;
         duration = qMax(duration, cell.mediaPlayer->duration());
-        playing = playing || cell.mediaPlayer->playbackState() == QMediaPlayer::PlayingState;
+        playerIsPlaying = playerIsPlaying ||
+            (!cell.pauseAfterFirstFrame &&
+             cell.mediaPlayer->playbackState() == QMediaPlayer::PlayingState);
     }
 
     const bool hasVideos = videoCount > 0;
+    if (!hasVideos) {
+        m_videoPlaybackRequested = false;
+    }
     if (m_videoPlayAction) {
-        m_videoPlayAction->setEnabled(hasVideos);
-        m_videoPlayAction->setText(playing ? tr("暂停全部视频") : tr("播放全部视频"));
+        m_videoPlayAction->setEnabled(hasVideos && !m_videoPlaybackRequested && !playerIsPlaying);
+    }
+    if (m_videoPauseAction) {
+        m_videoPauseAction->setEnabled(hasVideos && (m_videoPlaybackRequested || playerIsPlaying));
     }
     if (m_videoStopAction) {
         m_videoStopAction->setEnabled(hasVideos);
@@ -1855,25 +1990,15 @@ void ComparePanel::onVideoPositionChanged(qint64 position)
         return;
     }
 
-    if (videoCellIndexForSender(sender()) < 0) {
+    const int masterIndex = videoMasterIndex();
+    if (masterIndex < 0 || videoCellIndexForSender(sender()) != masterIndex) {
         return;
     }
 
     m_videoRequestedPosition = position;
-
-    m_videoSyncing = true;
-    for (const ImageCell &cell : m_cells) {
-        if (cell.isVideo && cell.mediaPlayer && cell.mediaPlayer != sender()) {
-            if (qAbs(cell.mediaPlayer->position() - position) > 120) {
-                cell.mediaPlayer->setPosition(position);
-            }
-        }
+    if (m_videoUiRefreshTimer && !m_videoUiRefreshTimer->isActive()) {
+        m_videoUiRefreshTimer->start();
     }
-    m_videoSyncing = false;
-    if (m_videoTimeline && !m_videoTimeline->isSliderDown()) {
-        m_videoTimeline->setValue(static_cast<int>(position));
-    }
-    updateVideoControls();
 }
 
 void ComparePanel::onVideoDurationChanged(qint64 /*duration*/)
@@ -1902,32 +2027,113 @@ void ComparePanel::seekVideos(int position)
     updateVideoControls();
 }
 
-void ComparePanel::toggleVideoPlayback()
+void ComparePanel::playVideos()
 {
-    bool shouldPause = false;
-    for (const ImageCell &cell : m_cells) {
-        if (cell.isVideo && cell.mediaPlayer &&
-            cell.mediaPlayer->playbackState() == QMediaPlayer::PlayingState) {
-            shouldPause = true;
-            break;
-        }
-    }
-
-    for (const ImageCell &cell : m_cells) {
+    bool foundVideo = false;
+    m_videoPlaybackRequested = true;
+    for (ImageCell &cell : m_cells) {
         if (!cell.isVideo || !cell.mediaPlayer) {
             continue;
         }
-        if (shouldPause) {
-            cell.mediaPlayer->pause();
-        } else {
-            cell.mediaPlayer->play();
+        foundVideo = true;
+        cell.pauseAfterFirstFrame = false;
+        if (cell.mediaPlayer->audioOutput()) {
+            cell.mediaPlayer->audioOutput()->setMuted(false);
         }
+        cell.mediaPlayer->play();
+    }
+    if (!foundVideo) {
+        m_videoPlaybackRequested = false;
+    }
+    updateVideoControls();
+}
+
+void ComparePanel::pauseVideos()
+{
+    const int masterIndex = videoMasterIndex();
+    const qint64 masterPosition = masterIndex >= 0
+        ? m_cells[masterIndex].mediaPlayer->position()
+        : 0;
+    m_videoPlaybackRequested = false;
+    m_videoRequestedPosition = masterPosition;
+
+    for (ImageCell &cell : m_cells) {
+        if (!cell.isVideo || !cell.mediaPlayer) {
+            continue;
+        }
+        cell.pauseAfterFirstFrame = false;
+        if (cell.mediaPlayer->audioOutput()) {
+            cell.mediaPlayer->audioOutput()->setMuted(false);
+        }
+        cell.mediaPlayer->pause();
+    }
+
+    if (m_videoTimeline) {
+        const QSignalBlocker blocker(m_videoTimeline);
+        m_videoTimeline->setValue(static_cast<int>(masterPosition));
+    }
+    updateVideoControls();
+    QTimer::singleShot(50, this, [this]() { alignPausedVideosToMaster(); });
+}
+
+void ComparePanel::alignPausedVideosToMaster(int retryCount)
+{
+    if (m_videoPlaybackRequested) {
+        return;
+    }
+
+    const int masterIndex = videoMasterIndex();
+    if (masterIndex < 0) {
+        return;
+    }
+
+    bool stillPlaying = false;
+    for (ImageCell &cell : m_cells) {
+        if (!cell.isVideo || !cell.mediaPlayer) {
+            continue;
+        }
+        if (cell.mediaPlayer->playbackState() == QMediaPlayer::PlayingState) {
+            cell.mediaPlayer->pause();
+            stillPlaying = true;
+        }
+    }
+    if (stillPlaying) {
+        if (retryCount < 60) {
+            QTimer::singleShot(50, this, [this, retryCount]() {
+                alignPausedVideosToMaster(retryCount + 1);
+            });
+        }
+        return;
+    }
+
+    const qint64 masterPosition = m_cells[masterIndex].mediaPlayer->position();
+    const qint64 toleranceMs = qMax<qint64>(10, qRound64(500.0 / m_videoFrameRate));
+    m_videoRequestedPosition = masterPosition;
+    m_videoSyncing = true;
+    for (int i = 0; i < m_cells.size(); ++i) {
+        ImageCell &cell = m_cells[i];
+        if (i == masterIndex || !cell.isVideo || !cell.mediaPlayer) {
+            continue;
+        }
+        const qint64 duration = cell.mediaPlayer->duration();
+        const qint64 target = duration > 0
+            ? qMin(masterPosition, duration)
+            : masterPosition;
+        if (qAbs(cell.mediaPlayer->position() - target) > toleranceMs) {
+            cell.mediaPlayer->setPosition(target);
+        }
+    }
+    m_videoSyncing = false;
+    if (m_videoTimeline) {
+        const QSignalBlocker blocker(m_videoTimeline);
+        m_videoTimeline->setValue(static_cast<int>(masterPosition));
     }
     updateVideoControls();
 }
 
 void ComparePanel::stopVideos()
 {
+    m_videoPlaybackRequested = false;
     m_videoRequestedPosition = 0;
     m_videoSyncing = true;
     for (const ImageCell &cell : m_cells) {
@@ -1958,6 +2164,8 @@ void ComparePanel::stepVideoFrame(int direction)
         return;
     }
 
+    m_videoPlaybackRequested = false;
+
     const qint64 frameStepMs = qMax<qint64>(1, qRound64(1000.0 / m_videoFrameRate));
     const qint64 target = qBound<qint64>(0, position + direction * frameStepMs, duration);
     seekVideos(static_cast<int>(target));
@@ -1972,6 +2180,7 @@ void ComparePanel::stepVideoFrame(int direction)
 void ComparePanel::toggleVideoDiff(bool enabled)
 {
     m_videoDiffEnabled = enabled;
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
     for (ImageCell &cell : m_cells) {
         if (!cell.isVideo) {
             continue;
@@ -1980,6 +2189,13 @@ void ComparePanel::toggleVideoDiff(bool enabled)
             cell.lastDiffFrameCaptureMs = 0;
             cell.videoWidget->hide();
             cell.imageWidget->show();
+            if (cell.videoSink) {
+                const QVideoFrame currentFrame = cell.videoSink->videoFrame();
+                if (currentFrame.isValid()) {
+                    cell.currentVideoFrame = currentFrame.toImage();
+                    cell.lastDiffFrameCaptureMs = nowMs;
+                }
+            }
         } else {
             cell.imageWidget->hide();
             cell.videoWidget->show();
@@ -1998,6 +2214,11 @@ void ComparePanel::updateVideoDiff()
         return;
     }
 
+    if (m_videoDiffWatcher && m_videoDiffWatcher->isRunning()) {
+        m_videoDiffRerunRequested = true;
+        return;
+    }
+
     int baseIndex = -1;
     for (int i = 0; i < m_cells.size(); ++i) {
         if (m_cells[i].isVideo && !m_cells[i].currentVideoFrame.isNull()) {
@@ -2009,20 +2230,38 @@ void ComparePanel::updateVideoDiff()
         return;
     }
 
-    const QImage base = m_cells[baseIndex].currentVideoFrame
-        .scaled(QSize(640, 640), Qt::KeepAspectRatio, Qt::FastTransformation);
-    m_cells[baseIndex].imageWidget->setImage(base, false);
-
+    const QImage baseFrame = m_cells[baseIndex].currentVideoFrame;
+    QList<QImage> targetFrames;
+    QStringList targetPaths;
     for (int i = 0; i < m_cells.size(); ++i) {
         if (i == baseIndex || !m_cells[i].isVideo ||
             m_cells[i].currentVideoFrame.isNull()) {
             continue;
         }
-        const QImage target = m_cells[i].currentVideoFrame
-            .scaled(base.size(), Qt::IgnoreAspectRatio, Qt::FastTransformation);
-        const QImage diff = ImageComparer::generateToleranceMap(base, target, m_threshold);
-        m_cells[i].imageWidget->setImage(diff, false);
+        targetFrames.append(m_cells[i].currentVideoFrame);
+        targetPaths.append(m_cells[i].imagePath);
     }
+
+    m_videoDiffBasePath = m_cells[baseIndex].imagePath;
+    m_videoDiffTargetPaths = targetPaths;
+    const int threshold = m_threshold;
+    m_videoDiffWatcher->setFuture(QtConcurrent::run(
+        [baseFrame, targetFrames, threshold]() {
+            QList<QImage> results;
+            const QImage base = baseFrame.scaled(
+                QSize(640, 640), Qt::KeepAspectRatio, Qt::FastTransformation);
+            if (base.isNull()) {
+                return results;
+            }
+            results.append(base);
+            for (const QImage &targetFrame : targetFrames) {
+                const QImage target = targetFrame.scaled(
+                    base.size(), Qt::IgnoreAspectRatio, Qt::FastTransformation);
+                results.append(ImageComparer::generateToleranceMap(
+                    base, target, threshold));
+            }
+            return results;
+        }));
 }
 
 void ComparePanel::resizeImageCell(int cellIndex)
@@ -2054,6 +2293,7 @@ void ComparePanel::showPreviewImage(int cellIndex, const QImage &preview, bool r
     cell.showingPreview = true;
     ensureResizedCompareImage(cellIndex);
     cell.imageWidget->setImage(imageForCompare(cellIndex), resetView);
+    cell.imageWidget->setRotationDegrees(cell.rotationDegrees, false);
 
     if (previousReferenceSize != resizeReferenceSize()) {
         refreshCellsUsingLargestImage();
@@ -2076,6 +2316,7 @@ void ComparePanel::showOriginalImage(int cellIndex, bool resetView)
     }
 
     cell.imageWidget->setImage(displayImage, resetView);
+    cell.imageWidget->setRotationDegrees(cell.rotationDegrees, false);
     cell.showingPreview = cell.originalImage.isNull() && !cell.previewImage.isNull();
     cell.showingToleranceMap = false;
     cell.toleranceSourceIndex = -1;
@@ -2796,7 +3037,8 @@ int ComparePanel::findCellByDragObject(QObject *object) const
             object == cell.indexBadge ||
             object == cell.headerLabel ||
             object == cell.imageContainer ||
-            object == cell.imageWidget) {
+            object == cell.imageWidget ||
+            object == cell.videoWidget) {
             return i;
         }
     }
@@ -2826,6 +3068,18 @@ int ComparePanel::findCellByWidget(QObject *widget) const
         }
     }
     return -1;
+}
+
+void ComparePanel::rotateSelectedMedia(int degrees)
+{
+    const int cellIndex = currentCellIndex();
+    if (cellIndex < 0 || cellIndex >= m_cells.size() || m_cells[cellIndex].isVideo) {
+        return;
+    }
+
+    ImageCell &cell = m_cells[cellIndex];
+    cell.rotationDegrees = (cell.rotationDegrees + degrees + 360) % 360;
+    cell.imageWidget->setRotationDegrees(cell.rotationDegrees);
 }
 
 void ComparePanel::onCellZoomChanged(double zoomLevel, QPointF focalPoint)

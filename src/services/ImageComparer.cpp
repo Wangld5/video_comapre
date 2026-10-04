@@ -54,13 +54,14 @@ struct RowContext {
 
 // Dedicated pool for the per-row fan-out below. If inner blockingMap shared the
 // outer job pool, its sole dispatcher thread would starve its own row work. This
-// separate pool keeps row parallelism available. Intentionally leaked (never
-// destroyed) to sidestep static-destruction ordering at program exit.
+// separate pool keeps row parallelism available. Cap it at two workers so
+// continuous video-frame comparisons leave CPU time for decoding and UI input.
+// Intentionally leaked (never destroyed) to sidestep static-destruction ordering.
 QThreadPool *toleranceRowPool()
 {
     static QThreadPool *pool = [] {
         auto *p = new QThreadPool;
-        p->setMaxThreadCount(qMax(2, QThread::idealThreadCount()));
+        p->setMaxThreadCount(qBound(1, QThread::idealThreadCount() / 2, 2));
         return p;
     }();
     return pool;

@@ -11,6 +11,9 @@
 #include <QInputDialog>
 #include <QLineEdit>
 #include <QTimer>
+#include <QAction>
+#include <QMediaPlayer>
+#include <QVideoSink>
 #include <algorithm>
 
 #include "models/CompareSession.h"

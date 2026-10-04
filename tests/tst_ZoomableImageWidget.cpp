@@ -35,6 +35,7 @@ private slots:
     void testHasImage();
     void testSetZoomLevelAnchorsFocalPoint();
     void testNormalizedPanSyncAcrossDifferentSizes();
+    void testRotationWrapAndReset();
 };
 
 namespace {
@@ -324,6 +325,22 @@ void TestZoomableImageWidget::testNormalizedPanSyncAcrossDifferentSizes()
     QVERIFY2(std::abs(fracA.y() - fracB.y()) < 1e-9,
              qPrintable(QString("widget-fraction y mismatch: A=%1 B=%2")
                             .arg(fracA.y()).arg(fracB.y())));
+}
+
+void TestZoomableImageWidget::testRotationWrapAndReset()
+{
+    ZoomableImageWidget widget;
+    widget.setImage(createTestImage(80, 40));
+
+    widget.rotateBy(90, false);
+    QCOMPARE(widget.rotationDegrees(), 90);
+    widget.rotateBy(270, false);
+    QCOMPARE(widget.rotationDegrees(), 0);
+    widget.setRotationDegrees(-90, false);
+    QCOMPARE(widget.rotationDegrees(), 270);
+
+    widget.setImage(createTestImage(40, 80), true);
+    QCOMPARE(widget.rotationDegrees(), 0);
 }
 
 QTEST_MAIN(TestZoomableImageWidget)

@@ -13,12 +13,14 @@ int main(int argc, char *argv[])
     QApplication::setOrganizationName("ImageCompare");
 
     // Application icon
-    app.setWindowIcon(QIcon(":/icons/app_icon.png"));
+    const QIcon applicationIcon(QStringLiteral(":/icons/play-media-sign-technology-icon.jpg"));
+    app.setWindowIcon(applicationIcon);
 
     // Apply Fluent 2 design system
     FluentStyle::applyGlobalStyle(&app);
 
     MainWindow mainWindow;
+    mainWindow.setWindowIcon(applicationIcon);
     mainWindow.show();
 
     return app.exec();

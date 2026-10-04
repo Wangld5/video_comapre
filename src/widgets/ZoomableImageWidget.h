@@ -5,6 +5,7 @@
 #include <QImage>
 #include <QPixmap>
 #include <QPointF>
+#include <QTransform>
 
 /**
  * @brief A widget that displays an image with zoom and pan support.
@@ -104,6 +105,10 @@ public:
      */
     void resetView(bool emitSignal = false);
 
+    int rotationDegrees() const { return m_rotationDegrees; }
+    void rotateBy(int degrees, bool emitSignal = true);
+    void setRotationDegrees(int degrees, bool emitSignal = true);
+
 signals:
     /**
      * @brief Emitted when zoom level changes via user interaction.
@@ -124,6 +129,7 @@ signals:
      * @brief Emitted when the view is reset via user interaction.
      */
     void viewReset();
+    void rotationChanged(int degrees);
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -144,6 +150,8 @@ private:
      * @brief Compute the effective scale: fitScale * zoomLevel.
      */
     double effectiveScale() const;
+    QSizeF rotatedImageSize() const;
+    QTransform imageToWidgetTransform(bool includePan = true) const;
 
     /**
      * @brief Map a widget coordinate to normalized image coordinate [0,1].
@@ -177,6 +185,7 @@ private:
     QString m_text;           ///< Placeholder text when no image
     double m_zoomLevel = 1.0; ///< 1.0 = fit-to-view, >1.0 = zoomed in
     QPointF m_panOffset;      ///< Pan offset in image pixels
+    int m_rotationDegrees = 0;
 
     bool m_isPanning = false;
     QPoint m_lastMousePos;
